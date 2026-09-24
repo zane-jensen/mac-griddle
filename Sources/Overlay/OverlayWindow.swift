@@ -2,9 +2,10 @@ import AppKit
 import MacGriddleCore
 
 /// One borderless, click-through overlay window covering exactly one
-/// `NSScreen`. Owned and recreated by `GridOverlayController` (see
-/// GridOverlayController.swift) — never instantiated directly by `Input`
-/// or anything outside this target.
+/// `NSScreen`'s *visible* frame (i.e. excluding the menu bar and Dock, if
+/// present — see the doc comment on `make(for:)`). Owned and recreated by
+/// `GridOverlayController` (see GridOverlayController.swift) — never
+/// instantiated directly by `Input` or anything outside this target.
 ///
 /// See docs/architecture/chunks/overlay-rendering.md §1.
 final class OverlayWindow: NSWindow {
@@ -22,6 +23,17 @@ final class OverlayWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 
     /// The only supported way to construct an `OverlayWindow`.
+    ///
+    /// Sized to `screen.visibleFrame`, not `screen.frame` — deliberately,
+    /// and consistently with `screenFrame(containing:)` in
+    /// `Input/ScreenResolution.swift`, which is what actually drives where
+    /// windows get snapped. `frame` includes the menu bar (and Dock, if
+    /// visible); drawing the grid across that full area made the top row
+    /// visually overlap the menu bar even though any window snapped there
+    /// would get silently pushed down/away from it by macOS — confirmed via
+    /// manual testing. Both this window's bounds and the actual snap-target
+    /// math need to agree on the same usable area, or the overlay's preview
+    /// and the real result diverge.
     ///
     /// This deliberately does NOT override either of `NSWindow`'s two
     /// designated initializers. Confirmed via a real crash
@@ -44,13 +56,13 @@ final class OverlayWindow: NSWindow {
     /// construction has already fully completed.
     static func make(for screen: NSScreen) -> OverlayWindow {
         let window = OverlayWindow(
-            contentRect: screen.frame,
+            contentRect: screen.visibleFrame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
 
-        let contentView = GridOverlayContentView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        let contentView = GridOverlayContentView(frame: NSRect(origin: .zero, size: screen.visibleFrame.size))
         window.overlayContentView = contentView
         window.configureWindow(for: screen)
         window.contentView = contentView
@@ -68,7 +80,7 @@ final class OverlayWindow: NSWindow {
         isRestorable = false
         animationBehavior = .none
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        setFrame(screen.frame, display: false)
+        setFrame(screen.visibleFrame, display: false)
     }
 
     /// This window's frame converted to Quartz/global-display space

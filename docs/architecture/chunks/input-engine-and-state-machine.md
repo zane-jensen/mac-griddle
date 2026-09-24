@@ -561,3 +561,36 @@ concern, matching `preferences-ui.md` §6's existing bridging pattern for every 
 No changes needed to chunk 8's composition-root sequencing itself (§3 of that document) —
 only its `InputEngine(...)` call site's argument list, which was already marked as a guess
 in that chunk's own assumptions table.
+
+---
+
+## Post-launch revision: `GlobalMouseAndModifierTap` is now an active tap, not listen-only
+
+This chunk originally specified (and the shipped code enforced, with an explicit comment)
+that the tap must be `.listenOnly` — "must not be able to swallow/alter input." That
+constraint has been deliberately relaxed, found necessary by real manual testing: with
+live-resize enabled, the real window visibly fought itself while dragging ("shaky, keeps
+shifting back to a corner"). Root cause: a listen-only tap can observe a drag but never stop
+it, so macOS's own native window-drag (started by the user's title-bar mouse-down,
+independent of MacGriddle) kept moving the window to follow the cursor at the same time
+`InputEngine` was moving/resizing that same window to the grid-cell rect via Accessibility on
+every `leftMouseDragged` tick — two forces controlling one window's frame every frame.
+
+**Fix**: `GlobalMouseAndModifierTap` now uses `.defaultTap` (active). `InputEngine.handle
+(type:event:)` returns the event to pass it through, or `nil` to swallow it — and only ever
+returns `nil` for a `.leftMouseDragged` event, and only when `handleMouseDragged(to:)` reports
+it just took over the window's frame (state is `.anchored`/`.freeResize`, live-resize is on,
+`WindowControl.setFrame` returned `true`). Every other event and every other outcome always
+passes through unmodified — mouse-down, mouse-up, flagsChanged, the panic hotkey's keyDown,
+and ordinary dragging (live-resize off, or before anchoring) are all completely unaffected.
+
+The suppression condition is derived live from `state` on every event, not a separately
+managed flag — so there's nothing to leak or forget to tear down. The instant the gesture
+ends (mouse-up, cancel, panic-reset) or leaves those two states, the very next drag event
+passes through normally again.
+
+**Accepted trade-off**: an active tap can, in principle, block system-wide mouse input if its
+callback hangs, where a listen-only tap could not. The existing `tapDisabledByTimeout`/
+`tapDisabledByUserInput` self-heal (already present, unchanged) is the safety net — it matters
+more now than it used to. See `docs/REVIEW.md`'s live-resize drag-takeover entry for the full
+writeup and manual-test results.

@@ -16,10 +16,19 @@ func screen(containing quartzPoint: CGPoint) -> NSScreen? {
 /// momentarily falls between displays during a resolution change) so grid
 /// math always has *some* valid screenFrame rather than needing to handle
 /// nil at every call site.
+///
+/// Uses `visibleFrame`, not `frame` — deliberately. `frame` includes the
+/// menu bar (and Dock, if visible), and macOS silently pushes any window
+/// positioned to overlap either of those down/away from it. Computing grid
+/// cells against the full `frame` let the top row (and, with a visible
+/// Dock, potentially an edge row) overlap those reserved areas, so a
+/// window snapped there landed a few pixels away from where the grid
+/// showed it — confirmed via manual testing. `visibleFrame` is exactly the
+/// region a normal window can actually occupy.
 func screenFrame(containing quartzPoint: CGPoint) -> CGRect {
     let height = ScreenSpace.primaryScreenHeight()
-    let cocoaFrame = screen(containing: quartzPoint)?.frame
-        ?? NSScreen.screens.first?.frame
+    let cocoaFrame = screen(containing: quartzPoint)?.visibleFrame
+        ?? NSScreen.screens.first?.visibleFrame
         ?? .zero
     return ScreenSpace.cocoaToQuartz(cocoaFrame, primaryScreenHeight: height)
 }

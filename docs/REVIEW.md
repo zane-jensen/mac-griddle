@@ -758,3 +758,140 @@ regardless of anything in this app's own code. Xcode's Run button remains genuin
 reproducing crashes (exact `fatalError` messages, immediately) but should not be used to test
 onboarding/permissions/the live gesture — use `.build/MacGriddle.app` (via
 `Scripts/build-app.sh`) for that.
+
+---
+
+## Sixth fix: live-resize fighting the OS's own native window-drag
+
+User report: with "Resize live while dragging" enabled, the real window was "REALLY shaky...
+like it keeps dragging and shifting back to the top left corner."
+
+Diagnosis (from reading the actual code, not guessed): `InputEngine`'s `coveringRect` is a
+pure function of a fixed anchor, the current cursor point, and a locked `screenFrame` — no
+feedback loop. `WindowControl.setFrame` writes position before size, correctly. Neither of
+MacGriddle's own computations was the bug.
+
+The real cause: `GlobalMouseAndModifierTap` was deliberately `.listenOnly` — it can *observe*
+a drag but never stop it. Left-clicking a title bar starts a completely independent native
+window-drag inside WindowServer that continuously moves the window to follow the cursor. With
+live-resize on, `InputEngine` was *also* calling `AXUIElementSetAttributeValue` on every
+`leftMouseDragged` tick to move/resize that same window to the grid-cell rect. Two independent
+forces fighting over one window's frame, every frame — that's the shakiness and the pull
+toward a corner.
+
+Three remediation options were presented to the user (best-effort throttling only; drop
+real-window live movement and keep just the overlay preview; or take over the drag entirely).
+**Chosen: take over the drag.**
+
+**Fix**: `GlobalMouseAndModifierTap` switched from `.listenOnly` to `.defaultTap` (active).
+`InputEngine.handle(type:event:)` now returns `CGEvent?` — the event to pass through, or `nil`
+to swallow — and only ever swallows a `.leftMouseDragged` event, and only when
+`handleMouseDragged(to:)` reports it just took over the window's frame (state
+`.anchored`/`.freeResize`, live-resize on, `setFrame` returned `true`). Every other event type,
+and every other outcome, always passes through unmodified. The condition is derived live from
+`state` on every single event rather than a separately-managed flag, so there is no lifecycle
+to get wrong — suppression starts and stops exactly when `state` says it should, with nothing
+to leak if a gesture ends abnormally (panic hotkey, `stop()`, permission revocation).
+
+**Verified**: clean build, 15/15 GridEngine tests still pass, packaged app rebuilds cleanly.
+**Not yet verified**: the actual smoothness fix and — just as important — that ordinary
+window dragging is completely unaffected once a suppressed gesture ends. This is exactly the
+kind of change that can't be confirmed by build/unit tests; see `docs/MANUAL_VERIFICATION.md`'s
+updated live-resize section for the specific regression checks added for this.
+
+**Fifth lesson recorded**: this reverses a previously deliberate, explicitly-commented safety
+decision ("never `.defaultTap` — must not be able to swallow/alter input"). That comment is
+now updated to explain exactly how narrowly the new swallow behavior is scoped, specifically
+so a future session doesn't "fix" this back to listen-only thinking it's an accidental
+regression — see the addendum in `docs/architecture/chunks/input-engine-and-state-machine.md`.
+
+---
+
+## Seventh fix: menu bar not excluded from the grid, and a mouse-up race in live-resize
+
+User report after retesting the drag-takeover fix: live-resize is much smoother, but two
+issues remained. (1) Snapping to the top row of the grid (in *any* mode, not just live-resize)
+pushed the window down slightly instead of landing flush. (2) With live-resize on, releasing
+the mouse jumped the resized window toward the cursor instead of staying at the final rect.
+
+**Issue 1 root cause**: `screenFrame(containing:)` (`Input/ScreenResolution.swift`) and
+`OverlayWindow.make(for:)` both used `NSScreen.frame` — the *full* screen bounds, including
+the menu bar (and Dock, if visible). Grid cells were computed across that entire area, so the
+top row's cells physically overlapped the menu bar. macOS silently pushes any window
+positioned to overlap the menu bar down and away from it, so a window "snapped" to a top-row
+cell always landed a few pixels off from where the grid showed it.
+
+**Fix**: both switched to `NSScreen.visibleFrame` (excludes the menu bar and Dock). Verified
+by hand-checking the Cocoa→Quartz flip math against the unchanged `primaryScreenHeight`
+reference: a `visibleFrame` with a 25px menu bar and no Dock correctly flips to a Quartz rect
+with `origin.y = 25`, i.e. starting exactly below the menu bar. `screen(containing:)` (used
+only to identify *which* screen a point is on) deliberately still uses `.frame` — hit-testing
+screen membership should still count the menu bar/Dock area as part of that screen.
+
+**Issue 2 root cause**: the live-resize drag-takeover fix (previous section) deliberately never
+suppressed the *final* `leftMouseUp` — reasoning that the native drag should always get an
+unmodified event to end its own tracking cleanly. In practice, because every *intermediate*
+`leftMouseDragged` had been suppressed, WindowServer's native drag-tracking had a backlog of
+unseen cursor movement; on that final, unsuppressed mouse-up it performed one last native
+"catch up to the cursor" repositioning — landing right after (and overwriting) the correct
+final frame `handleMouseUp` had just set via Accessibility.
+
+**Fix**: `handleMouseUp` now returns `Bool` (mirroring `handleMouseDragged`), and
+`InputEngine.handle(type:event:)` swallows the final `.leftMouseUp` too, under the exact same
+condition (`.anchored`/`.freeResize`, live-resize on, `setFrame` succeeded). Every other
+mouse-up case (idle/dragging/cancel, or a commit with live-resize off) is untouched — those
+paths never suppressed the drag either, so their native tracking still needs a normal,
+unmodified mouse-up to terminate cleanly.
+
+**Verified**: clean build, 15/15 tests, packaged app rebuilds cleanly. **Not yet verified**:
+the actual fix on-device, and specifically whether swallowing the final mouse-up leaves any
+"stuck click" residue in the target app — added as an explicit check in
+`docs/MANUAL_VERIFICATION.md`'s live-resize section.
+
+---
+
+## Eighth fix: unsigned builds meant TCC forgot every grant on every single rebuild
+
+User report: after rebuilding for the seventh/menu-bar fixes, onboarding appeared to complete
+but nothing actually worked afterward — no menu bar icon, gesture non-functional. Confirmed
+via `ps aux`/`log show` that the process was alive and not crashing (no new `.ips` report, no
+fatal errors — just ordinary `linkd.autoShortcut` noise already known to be benign). The
+process being fine but "nothing works" pointed at the permission layer again, but this turned
+out to be a **third, distinct** cause in that same family — not a repeat of the fourth fix
+(Launch Services never registered the bundle) or the seventh (two conflicting registrations).
+
+**Root cause**: `Scripts/build-app.sh` never signed the app at all — not even ad-hoc. Both
+fully unsigned and ad-hoc (`codesign --sign -`) binaries get a designated requirement keyed to
+the exact hash of their own bytes (confirmed against multiple independent real-world reports
+of the identical failure mode). Since every rebuild produces different bytes, **every rebuild
+is a brand-new app to TCC** — every previously granted Accessibility/Input Monitoring
+permission silently stops applying, immediately, with zero error surfaced anywhere. This had
+been happening the entire session; it just hadn't been isolated from the other two
+Launch-Services-related causes until now.
+
+**Fix**: created a stable, local, self-signed code-signing certificate ("MacGriddle Local
+Dev") in the login keychain (`openssl req -x509` with the `codeSigning` extended key usage,
+imported via `security import -T /usr/bin/codesign`, trusted for code signing via
+`security add-trusted-cert -p codeSign`). `Scripts/build-app.sh` now signs the assembled
+bundle with this identity as part of every build. Verified empirically, not just asserted:
+built twice in a row (touching a source file between builds to force a real rebuild) and
+confirmed `codesign -d -r-` produced the **identical** designated requirement both times —
+`identifier "com.macgriddle.app" and certificate leaf = H"60ca5cbe…"` — anchored to the
+certificate, not the binary's content. This survives every future rebuild unchanged.
+
+Hit one codesign wrinkle along the way: `codesign --force --deep --sign` failed with
+`errSecInternal Component` when re-signing over a previous ad-hoc signature. Signing the
+bundle directly (no `--deep`) worked immediately — and `--deep` was never actually needed
+here anyway, since this bundle has no nested frameworks/helpers to recurse into.
+
+One-time cost of switching signing strategy: `tccutil reset Accessibility`/`ListenEvent`
+for `com.macgriddle.app` (the identity changed once more, from adhoc to properly signed) —
+after this, no more resets should ever be needed for a rebuild again.
+
+**Sixth lesson recorded**: three different, real bugs (Launch Services registration, duplicate
+registrations, and now unsigned-binary identity instability) all present nearly identically
+from the user's side — "granted the permission, nothing happens." Each time, the fix was to
+check a different specific thing (`tccutil reset`'s error message; `lsregister -dump`'s
+registration count; `codesign -d -r-`'s designated-requirement stability across two builds)
+rather than guessing which of the three it was. This eighth fix is the first of the three that
+prevents its entire *class* of bug from recurring at all, rather than clearing one bad state.

@@ -98,22 +98,41 @@ public final class InputEngine {
     /// §7 panic-hotkey check into the real switch-on-(state, event)
     /// implementation. Delegates to one private handler per CGEventType;
     /// each of those switches on the current `InternalState`.
-    private func handle(type: CGEventType, event: CGEvent) {
+    ///
+    /// Returns the event to pass it through unmodified, or `nil` to swallow
+    /// it. Only ever swallows `.leftMouseDragged` or the gesture-ending
+    /// `.leftMouseUp`, and only when the corresponding handler reports it
+    /// just took exclusive control of the window's frame via Accessibility
+    /// — see `handleMouseDragged`'s and `handleMouseUp`'s doc comments.
+    /// Every other event type, and every other outcome, always passes
+    /// through: mouse-down, flagsChanged, and the panic hotkey's keyDown
+    /// are never suppressed, and ordinary dragging (live-resize off, or
+    /// before anchoring) is completely unaffected.
+    private func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         switch type {
         case .keyDown:
             handleKeyDown(event)
         case .leftMouseDown:
             handleMouseDown(at: event.location)
         case .leftMouseDragged:
-            handleMouseDragged(to: event.location)
+            if handleMouseDragged(to: event.location) {
+                return nil // took over this tick's frame via AX — don't let
+                            // WindowServer's native drag fight us for it
+            }
         case .leftMouseUp:
-            handleMouseUp(at: event.location)
+            if handleMouseUp(at: event.location) {
+                return nil // same reason as above, for the final tick —
+                            // otherwise WindowServer's native drag does one
+                            // last "catch up to the cursor" jump right after
+                            // we set the correct final frame
+            }
         case .flagsChanged:
             handleFlagsChanged(optionHeld: event.flags.contains(.maskAlternate), at: event.location)
         default:
             break // tapDisabledByTimeout/ByUserInput are already handled and
                    // swallowed inside GlobalMouseAndModifierTap itself.
         }
+        return event
     }
 
     /// §7: unconditional force-reset, safe to invoke from any state
@@ -145,10 +164,21 @@ public final class InputEngine {
     }
 
     /// §3 table's `leftMouseDragged` rows, plus §6's live-resize branch.
-    private func handleMouseDragged(to point: CGPoint) {
+    ///
+    /// Returns whether MacGriddle just took exclusive control of the
+    /// window's frame for this tick — `true` only when live-resize is on
+    /// AND `windowControl.setFrame` actually succeeded. `handle(type:event:)`
+    /// uses this to decide whether to swallow the event (see that method's
+    /// doc comment, and `GlobalMouseAndModifierTap`'s, for why: this is what
+    /// stops WindowServer's native drag-follow from fighting our own
+    /// AX-driven repositioning every frame). Only suppressing on an actual
+    /// `setFrame` success matters here — if the write failed (non-resizable
+    /// window, dead AX reference), leave the native drag alone rather than
+    /// stranding the window with neither side actually moving it.
+    private func handleMouseDragged(to point: CGPoint) -> Bool {
         switch state {
         case .idle, .dragging:
-            break // no row for these — the native OS drag continues untouched
+            return false // no row for these — the native OS drag continues untouched
 
         case .gridActive:
             // Before anchoring, re-resolve the screen under the cursor on
@@ -164,35 +194,50 @@ public final class InputEngine {
             )
             let publicState = state.publicState
             onMainRunLoop { [overlay] in overlay.updateSelection(rect: hoveredCellRect, state: publicState) }
+            return false
 
         case .anchored(let candidate, let anchor):
             let rect = coveringRect(candidate: candidate, anchor: anchor, at: point)
             let publicState = state.publicState
             onMainRunLoop { [overlay] in overlay.updateSelection(rect: rect, state: publicState) }
-            if liveResizeEnabled {
-                windowControl.setFrame(rect, of: candidate.window)
-            }
+            guard liveResizeEnabled else { return false }
+            return windowControl.setFrame(rect, of: candidate.window)
 
         case .freeResize(let candidate, let anchorPoint):
             let rect = GridEngine.freeResizeRect(from: anchorPoint, to: point)
             let publicState = state.publicState
             onMainRunLoop { [overlay] in overlay.updateSelection(rect: rect, state: publicState) }
-            if liveResizeEnabled {
-                windowControl.setFrame(rect, of: candidate.window)
-            }
+            guard liveResizeEnabled else { return false }
+            return windowControl.setFrame(rect, of: candidate.window)
         }
     }
 
     /// §3 table's `leftMouseUp` rows: the ordinary-click discard, the
     /// cancel path, and the two commit paths (§5).
-    private func handleMouseUp(at point: CGPoint) {
+    ///
+    /// Returns whether to swallow this final event — mirrors
+    /// `handleMouseDragged`'s return, and for the same reason, but only
+    /// matters here for `.anchored`/`.freeResize` with live-resize on: for
+    /// the entire drag we've been suppressing `leftMouseDragged` so
+    /// WindowServer's native drag-follow can't fight our AX writes (see
+    /// that method's doc comment). Real bug found via manual testing: since
+    /// the *final* mouse-up was never suppressed, WindowServer would
+    /// perform one last native repositioning on it — jumping the window
+    /// toward the cursor's current position — immediately undoing the
+    /// correct final frame we'd just set below. Swallowing it too, under
+    /// the exact same condition, closes that gap. Every other case here
+    /// (idle/dragging/cancel, or commit with live-resize off) never
+    /// suppresses: the native drag was never interrupted for those, so it
+    /// needs its own unmodified mouse-up to end its tracking cleanly.
+    private func handleMouseUp(at point: CGPoint) -> Bool {
         switch state {
         case .idle:
-            break
+            return false
 
         case .dragging:
             // Ordinary click/drag the OS already handled; discard candidate.
             state = .idle
+            return false
 
         case .gridActive(let candidate):
             // Cancel: leftMouseUp arriving in .gridActive means Option is
@@ -201,18 +246,21 @@ public final class InputEngine {
             windowControl.setFrame(candidate.originalFrame, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
+            return false
 
         case .anchored(let candidate, let anchor):
             let finalRect = coveringRect(candidate: candidate, anchor: anchor, at: point)
-            windowControl.setFrame(finalRect, of: candidate.window)
+            let tookOverFrame = windowControl.setFrame(finalRect, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
+            return liveResizeEnabled && tookOverFrame
 
         case .freeResize(let candidate, let anchorPoint):
             let finalRect = GridEngine.freeResizeRect(from: anchorPoint, to: point)
-            windowControl.setFrame(finalRect, of: candidate.window)
+            let tookOverFrame = windowControl.setFrame(finalRect, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
+            return liveResizeEnabled && tookOverFrame
         }
     }
 

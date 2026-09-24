@@ -48,6 +48,10 @@ support per `docs/RESEARCH.md` §B.1.5).
 - [ ] Move the cursor to a different cell — a rectangle spanning from the anchor to the
       current cell should highlight, growing/shrinking as you move.
 - [ ] Release the mouse button → the window should snap to exactly that rectangle.
+- [ ] **Top-row / menu-bar check**: repeat the gesture snapping to a cell in the *top* row of
+      the grid. The window should land flush with the grid line, not pushed down away from
+      the menu bar (this was a real bug — the grid used to include the menu bar's area as
+      usable space).
 - [ ] **Cancel test**: repeat the gesture, but release the mouse button *while ⌥ is still
       held*, before ever releasing Option to anchor. The window should stay exactly where it
       started — nothing should move.
@@ -79,9 +83,24 @@ support per `docs/RESEARCH.md` §B.1.5).
       the opacity slider. Close Preferences and try the gesture again — the new grid size,
       colors, and opacity should all be visible immediately (no restart needed).
 - [ ] Toggle **live-resize** on in the Behavior tab, then try the gesture again — the real
-      window should now visibly resize continuously as you drag, not just on release. Toggle
-      it back off afterward (snap-on-release is the recommended default — see
-      `docs/architecture/chunks/preferences-ui.md` for why).
+      window should now visibly resize continuously as you drag, **smoothly, matching the
+      overlay preview exactly with no jitter or pull toward a corner** (this used to fight the
+      OS's own native window-drag — see REVIEW.md's live-resize drag-takeover entry — confirm
+      it's actually fixed, not just less bad).
+  - [ ] **Regression check (important)**: immediately after that live-resize gesture ends
+        (mouse-up), drag the *same* window normally by its title bar with no gesture active
+        (no Option, live-resize irrelevant). It must behave exactly like ordinary macOS window
+        dragging — no lag, no residual suppression.
+  - [ ] **Release check**: right when you release the mouse button, the window must stay
+        exactly at the final rect it was already tracking — it should NOT jump toward the
+        cursor's position on release (this was a real bug: WindowServer's native drag used to
+        perform one last "catch up" repositioning on the final mouse-up, undoing the correct
+        frame we'd just set).
+  - [ ] **Panic hotkey mid-drag**: with live-resize on, start the gesture, anchor, and while
+        still dragging press **⌃⌥⇧Esc**. The window should release cleanly and immediately —
+        then confirm the regression check above still holds right after.
+  - [ ] Toggle live-resize back off afterward (snap-on-release is the recommended default —
+      see `docs/architecture/chunks/preferences-ui.md` for why).
 - [ ] Toggle **Launch MacGriddle at Login** on. Open System Settings → General → Login Items
       and confirm MacGriddle appears there. Toggle it off in MacGriddle's Preferences and
       confirm it disappears from Login Items.
