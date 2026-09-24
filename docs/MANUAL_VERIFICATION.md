@@ -92,10 +92,14 @@ support per `docs/RESEARCH.md` §B.1.5).
         (no Option, live-resize irrelevant). It must behave exactly like ordinary macOS window
         dragging — no lag, no residual suppression.
   - [ ] **Release check**: right when you release the mouse button, the window must stay
-        exactly at the final rect it was already tracking — it should NOT jump toward the
-        cursor's position on release (this was a real bug: WindowServer's native drag used to
-        perform one last "catch up" repositioning on the final mouse-up, undoing the correct
-        frame we'd just set).
+        exactly at the final rect it was already tracking — it should NOT visibly jump toward
+        the cursor's position on release (a brief, sub-50ms settle is expected and fine; a
+        persistent jump is not).
+  - [ ] **Next-click check (important)**: right after a live-resize gesture ends, click on a
+        *different*, unrelated window elsewhere on screen. That window must NOT move to where
+        you clicked (this was a real bug: swallowing the final mouse-up left WindowServer's
+        drag-tracking for the resized window stuck open, and the next click anywhere resolved
+        it by moving whatever it landed on).
   - [ ] **Panic hotkey mid-drag**: with live-resize on, start the gesture, anchor, and while
         still dragging press **⌃⌥⇧Esc**. The window should release cleanly and immediately —
         then confirm the regression check above still holds right after.

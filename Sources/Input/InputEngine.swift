@@ -100,14 +100,16 @@ public final class InputEngine {
     /// each of those switches on the current `InternalState`.
     ///
     /// Returns the event to pass it through unmodified, or `nil` to swallow
-    /// it. Only ever swallows `.leftMouseDragged` or the gesture-ending
-    /// `.leftMouseUp`, and only when the corresponding handler reports it
-    /// just took exclusive control of the window's frame via Accessibility
-    /// — see `handleMouseDragged`'s and `handleMouseUp`'s doc comments.
-    /// Every other event type, and every other outcome, always passes
-    /// through: mouse-down, flagsChanged, and the panic hotkey's keyDown
-    /// are never suppressed, and ordinary dragging (live-resize off, or
-    /// before anchoring) is completely unaffected.
+    /// it. Only ever swallows `.leftMouseDragged`, and only when
+    /// `handleMouseDragged` reports it just took exclusive control of the
+    /// window's frame via Accessibility — see that method's doc comment.
+    /// `.leftMouseUp` is deliberately never swallowed, even during
+    /// live-resize — see `handleMouseUp`'s doc comment for the real bug
+    /// that came from doing so. Every other event type, and every other
+    /// outcome, always passes through: mouse-down, mouse-up, flagsChanged,
+    /// and the panic hotkey's keyDown are never suppressed, and ordinary
+    /// dragging (live-resize off, or before anchoring) is completely
+    /// unaffected.
     private func handle(type: CGEventType, event: CGEvent) -> CGEvent? {
         switch type {
         case .keyDown:
@@ -120,12 +122,7 @@ public final class InputEngine {
                             // WindowServer's native drag fight us for it
             }
         case .leftMouseUp:
-            if handleMouseUp(at: event.location) {
-                return nil // same reason as above, for the final tick —
-                            // otherwise WindowServer's native drag does one
-                            // last "catch up to the cursor" jump right after
-                            // we set the correct final frame
-            }
+            handleMouseUp(at: event.location)
         case .flagsChanged:
             handleFlagsChanged(optionHeld: event.flags.contains(.maskAlternate), at: event.location)
         default:
@@ -216,28 +213,34 @@ public final class InputEngine {
     /// cancel path, and the two commit paths (§5).
     ///
     /// Returns whether to swallow this final event — mirrors
-    /// `handleMouseDragged`'s return, and for the same reason, but only
-    /// matters here for `.anchored`/`.freeResize` with live-resize on: for
-    /// the entire drag we've been suppressing `leftMouseDragged` so
-    /// WindowServer's native drag-follow can't fight our AX writes (see
-    /// that method's doc comment). Real bug found via manual testing: since
-    /// the *final* mouse-up was never suppressed, WindowServer would
-    /// perform one last native repositioning on it — jumping the window
-    /// toward the cursor's current position — immediately undoing the
-    /// correct final frame we'd just set below. Swallowing it too, under
-    /// the exact same condition, closes that gap. Every other case here
-    /// (idle/dragging/cancel, or commit with live-resize off) never
-    /// suppresses: the native drag was never interrupted for those, so it
-    /// needs its own unmodified mouse-up to end its tracking cleanly.
-    private func handleMouseUp(at point: CGPoint) -> Bool {
+    /// §3 table's `leftMouseUp` rows: the ordinary-click discard, the
+    /// cancel path, and the two commit paths (§5).
+    ///
+    /// Unlike `handleMouseDragged`, this never suppresses the event — a
+    /// real bug found via manual testing. An earlier version swallowed the
+    /// final mouse-up too, mirroring `handleMouseDragged`, specifically to
+    /// stop WindowServer's native drag from performing one last "catch up
+    /// to the cursor" jump that undid the correct final frame set below.
+    /// That worked, but left WindowServer's own drag-tracking for this
+    /// window with no matching mouse-up for the mouse-down that started
+    /// it — so the *next*, completely unrelated click anywhere would get
+    /// misinterpreted as resolving that still-open drag, moving whatever
+    /// window it landed on. Swallowing input events has consequences
+    /// beyond this gesture's own state machine.
+    ///
+    /// Fix: let the real mouse-up through unmodified so native drag-follow
+    /// closes out normally (performing its own jump if it wants to), then
+    /// re-apply the same final frame a moment later via
+    /// `reapplyFrameAfterNativeDragSettles`, overriding whatever native
+    /// drag just did.
+    private func handleMouseUp(at point: CGPoint) {
         switch state {
         case .idle:
-            return false
+            break
 
         case .dragging:
             // Ordinary click/drag the OS already handled; discard candidate.
             state = .idle
-            return false
 
         case .gridActive(let candidate):
             // Cancel: leftMouseUp arriving in .gridActive means Option is
@@ -246,21 +249,49 @@ public final class InputEngine {
             windowControl.setFrame(candidate.originalFrame, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
-            return false
 
         case .anchored(let candidate, let anchor):
             let finalRect = coveringRect(candidate: candidate, anchor: anchor, at: point)
-            let tookOverFrame = windowControl.setFrame(finalRect, of: candidate.window)
+            windowControl.setFrame(finalRect, of: candidate.window)
+            reapplyFrameAfterNativeDragSettles(finalRect, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
-            return liveResizeEnabled && tookOverFrame
 
         case .freeResize(let candidate, let anchorPoint):
             let finalRect = GridEngine.freeResizeRect(from: anchorPoint, to: point)
-            let tookOverFrame = windowControl.setFrame(finalRect, of: candidate.window)
+            windowControl.setFrame(finalRect, of: candidate.window)
+            reapplyFrameAfterNativeDragSettles(finalRect, of: candidate.window)
             onMainRunLoop { [overlay] in overlay.hide() }
             state = .idle
-            return liveResizeEnabled && tookOverFrame
+        }
+    }
+
+    /// Only matters when live-resize just suppressed the drag (see
+    /// `handleMouseDragged`) — a no-op re-apply is harmless when it didn't,
+    /// so this doesn't bother checking `liveResizeEnabled` itself. Delayed
+    /// (not just dispatched to the next run-loop turn) to reliably land
+    /// after WindowServer has finished processing the mouse-up we just let
+    /// through — see `handleMouseUp`'s doc comment for why this exists at
+    /// all. 50ms is short enough that any native "catch up" jump and this
+    /// correction read as one settle rather than two visible steps, and
+    /// long enough to not race WindowServer's own handling of the event.
+    ///
+    /// Re-reads the window's actual current frame first and only writes if
+    /// it's actually off — a real, if minor, issue found via manual
+    /// testing: writing unconditionally meant every live-resize gesture
+    /// ended with *two* `setFrame` calls in quick succession (the immediate
+    /// one above, then this one 50ms later) even on the — apparently
+    /// common — case where WindowServer's mouse-up handling never actually
+    /// disturbed the frame at all, and some apps visibly flash/redraw for
+    /// an instant on every `setFrame`. Skipping the redundant second write
+    /// removes that extra redraw for the common case while still applying
+    /// it on whatever fraction of gestures actually need the correction.
+    private func reapplyFrameAfterNativeDragSettles(_ frame: CGRect, of window: WindowHandle) {
+        guard liveResizeEnabled else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [windowControl] in
+            guard let currentFrame = windowControl.frame(of: window) else { return }
+            guard !currentFrame.isApproximatelyEqual(to: frame) else { return }
+            windowControl.setFrame(frame, of: window)
         }
     }
 
@@ -367,4 +398,18 @@ private func subscribeToPermissionsChange<P: PermissionsProviding>(
     handler: @escaping () -> Void
 ) -> AnyCancellable {
     permissions.objectWillChange.sink { _ in handler() }
+}
+
+/// Used only by `InputEngine.reapplyFrameAfterNativeDragSettles` to decide
+/// whether a correction is actually needed. A tight but non-zero tolerance
+/// — AX position/size round-trip through another process, and Quartz<->
+/// Cocoa conversions involve floating-point math, so exact equality would
+/// false-negative (and re-apply) on harmless sub-pixel noise.
+private extension CGRect {
+    func isApproximatelyEqual(to other: CGRect, tolerance: CGFloat = 0.5) -> Bool {
+        abs(origin.x - other.origin.x) < tolerance
+            && abs(origin.y - other.origin.y) < tolerance
+            && abs(width - other.width) < tolerance
+            && abs(height - other.height) < tolerance
+    }
 }

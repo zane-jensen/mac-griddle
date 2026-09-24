@@ -895,3 +895,69 @@ check a different specific thing (`tccutil reset`'s error message; `lsregister -
 registration count; `codesign -d -r-`'s designated-requirement stability across two builds)
 rather than guessing which of the three it was. This eighth fix is the first of the three that
 prevents its entire *class* of bug from recurring at all, rather than clearing one bad state.
+
+---
+
+## Ninth fix: swallowing the final mouse-up broke the *next*, unrelated click
+
+User report: live-resize itself now works great, but the first click made on *any* window
+right after a live-resize gesture moved that window to the click location.
+
+**Root cause**: the eighth fix (mouse-up race, two sections up) swallowed the gesture's final
+`leftMouseUp` to stop WindowServer's native drag from performing one last "catch up to cursor"
+jump. That worked, but had a side effect not caught by build/tests: WindowServer's own
+drag-tracking for the resized window never received a mouse-up matching the mouse-down that
+started the drag, leaving it "open." The *next* mouse-down+mouse-up anywhere — on a completely
+unrelated window — got interpreted as resolving that still-open drag, moving whatever it
+landed on. Swallowing an input event has consequences beyond this gesture's own state machine;
+this is exactly the "stuck click" risk flagged (but not yet confirmed) when that fix landed.
+
+**Fix**: stopped suppressing `leftMouseUp` entirely — it's now never swallowed, even during
+live-resize. `handleMouseUp` no longer returns a suppression signal at all (reverted to
+`Void`). Instead, `handleMouseUp` now calls the existing `windowControl.setFrame(finalRect,
+...)` as before, then separately calls a new `reapplyFrameAfterNativeDragSettles(_:of:)`,
+which — only when live-resize is on — re-applies that same final frame again 50ms later via
+`DispatchQueue.main.asyncAfter`. The real mouse-up reaches WindowServer normally now (so its
+drag-tracking always closes out cleanly), and if it performs its own "catch up" jump as a
+side effect, the deferred re-apply corrects it moments later — short enough to read as one
+settle rather than two visible steps, long enough to reliably land after WindowServer's own
+handling rather than racing it.
+
+**Verified**: clean build, 15/15 tests, packaged app rebuilds and re-signs cleanly with the
+same stable identity from the eighth fix (confirmed via `codesign -dv` — no TCC reset needed
+this time, since the signing identity didn't change, only the code — which is exactly what
+that fix was for). **Not yet verified on-device**: added an explicit "next-click check" to
+`docs/MANUAL_VERIFICATION.md`'s live-resize section for this specific regression.
+
+**Seventh lesson recorded**: when a fix involves swallowing/suppressing an OS input event,
+the blast radius isn't limited to the gesture that swallowed it — always explicitly check
+what happens to the *next*, unrelated interaction afterward, not just whether the original
+bug is gone.
+
+---
+
+## Tenth fix (cosmetic): reduced a brief flash right after a live-resize gesture ends
+
+User report: functionally everything now works, but the window briefly "disappears" right
+after releasing the mouse during a live-resize gesture.
+
+Best-justified fix without being able to reproduce this live: `reapplyFrameAfterNativeDragSettles`
+(added in the ninth fix, above) unconditionally re-applied the final frame 50ms after every
+live-resize gesture, regardless of whether WindowServer's own mouse-up handling had actually
+disturbed it. That means most gestures ended with *two* `setFrame` calls in quick succession
+— and some apps visibly redraw/flash for an instant on every `setFrame`, so an unconditional
+second write is a plausible, easy-to-fix contributor even without pinning down the exact
+rendering mechanism.
+
+**Fix**: `reapplyFrameAfterNativeDragSettles` now re-reads the window's actual current frame
+first (`WindowControlling.frame(of:)`) and only re-applies if it's actually off by more than a
+tight tolerance (0.5pt, via a new `CGRect.isApproximatelyEqual(to:)` — loose enough to absorb
+AX/coordinate-conversion floating-point noise, tight enough to still catch a real native
+"catch-up" jump). Skips the redundant write entirely on whatever fraction of gestures
+WindowServer didn't actually disturb.
+
+**Caveat, stated plainly**: this is a well-justified reduction in unnecessary work, not a
+confirmed fix for a root-caused rendering mechanism — that would need live reproduction this
+session couldn't do. If the flash persists after this, the next step is to look at whether
+the *first*, immediate `setFrame` call's own position-then-size two-step (documented in
+`AXWindowController+Frame.swift`) is itself the source, independent of this second call.
