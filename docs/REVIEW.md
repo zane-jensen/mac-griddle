@@ -961,3 +961,78 @@ confirmed fix for a root-caused rendering mechanism — that would need live rep
 session couldn't do. If the flash persists after this, the next step is to look at whether
 the *first*, immediate `setFrame` call's own position-then-size two-step (documented in
 `AXWindowController+Frame.swift`) is itself the source, independent of this second call.
+
+**Update: it didn't help.** Confirmed via a targeted follow-up question — the flash does
+*not* happen with live-resize off (ordinary snap-on-release), only with it on — which rules
+out "any `setFrame` at mouse-up flashes" and confirms it's specific to live-resize's
+drag-suppression architecture, not the tenth fix's redundant-write theory.
+
+---
+
+## Eleventh fix (higher risk, explicitly discussed with and approved by the user first): end the native drag early instead of at the end
+
+Real mechanism, now well-supported rather than guessed: while `.anchored`/`.freeResize`
+suppress `leftMouseDragged` (ninth fix), macOS still considers the window's *native* drag —
+started by the original, unsuppressed `leftMouseDown` — to be continuously ongoing for the
+entire suppressed span, since nothing ever tells it otherwise. When the real, final mouse-up
+eventually arrives, macOS transitions that window out of its own internal "being natively
+dragged" tracking, and that transition is what visibly flashes — independent of anything
+this engine writes via Accessibility. Snap-on-release never shows this because it never
+suppresses anything: native drag tracks the cursor continuously and ends via a completely
+ordinary, on-time mouse-up.
+
+**Fix**: post a synthetic `leftMouseUp` (via `CGEvent(mouseEventSource:mouseType:
+mouseCursorPosition:mouseButton:)` + `.post(tap: .cghidEventTap)`) right when suppression
+begins — the `.gridActive` → `.anchored` transition — at the cursor's current position.
+Native drag has been tracking normally right up to that instant, so ending it there should
+have no visible jump of its own, and macOS's native tracking for this window closes out
+cleanly and on time instead of at the real mouse-up much later. Tagged via
+`CGEventField.eventSourceUserData` with an arbitrary recognizable marker so
+`InputEngine.handle(type:event:)` — which sees everything posted to this pipeline, including
+its own synthetic event — passes it straight through without reprocessing it through the
+gesture state machine as if it were a real user action.
+
+**Real risk, explicitly discussed with and approved by the user before implementing** (not
+assumed away): this tells macOS the mouse button is "up" while the user is still physically
+holding it down. Every subsequent real `leftMouseDragged`/`leftMouseUp` is still handled by
+this engine's own state machine exactly as before (unchanged) — only macOS's own native
+drag-tracking perception of this one window's gesture end changes. What was *not* verifiable
+without live testing: how macOS or the target app's own event handling reacts to receiving
+further "dragged" events after being told the button already went up. Needs careful,
+comprehensive retesting, not just a check for whether the flash is gone — see
+`docs/MANUAL_VERIFICATION.md` for the added checks (stray drags on other windows, the target
+window's own behavior right at the anchor moment, and re-confirming every earlier live-resize
+fix — smoothness, correct final position, no stuck-click — still holds).
+
+**Verified**: clean build, 15/15 tests, packaged app rebuilds and signs cleanly.
+
+**REVERTED.** User testing found a real functional regression: releasing the mouse after a
+live-resize gesture no longer completed the snap at all — it only completed on the user's
+*next*, separate click. Root cause, exactly the risk flagged before implementing this:
+telling macOS the button was "up" via the synthetic event actually desynced macOS's own
+button-state tracking. When the user then *really* released the button, macOS's input layer
+apparently didn't generate a new "up" transition — it already believed the button was up
+from the synthetic event, so there was no state change left to report. The real mouse-up
+event this engine depends on for `handleMouseUp` never arrived; `state` stayed `.anchored`
+until the next click's mouse-up satisfied it instead (explaining exactly the "click again to
+complete it" symptom).
+
+This is a worse trade — a broken gesture completion — than the cosmetic flash it was meant to
+fix. Fully reverted: `postSyntheticMouseUpToEndNativeDrag`, the `syntheticEarlyDragCloseMarker`
+tag/check in `handle(type:event:)`, and the one call site in `handleFlagsChanged` are all
+removed, not just disabled. Confirmed via `grep` that nothing referencing them remains.
+Rebuilt, retested (15/15 tests, clean build/package) — back to the ninth/tenth fixes' behavior:
+smooth drag, correct final position, no stuck-click, small cosmetic flash on release remains
+unaddressed. `docs/MANUAL_VERIFICATION.md`'s "anchor-moment"/"stray-drag" checks added for this
+attempt were removed along with the code they were testing for.
+
+**Eighth lesson recorded**: synthesizing OS-level input events to manipulate a *different*
+subsystem's (WindowServer's) internal tracking is fundamentally different from, and riskier
+than, suppressing/observing real events — it can desync state in the OS layer itself, not just
+this app's own state machine, in ways that are very hard to predict without live testing. The
+explicit user sign-off obtained before attempting this was the right call; so is reverting
+immediately and completely on the first sign of a real regression, rather than trying to
+patch around a technique that's already shown it can silently break event delivery. The
+cosmetic flash remains open with no attempted fix currently in place — see the tenth fix's
+entry for the ruled-out theory and the note on where to look next (the *first*, immediate
+`setFrame` call's own position-then-size two-step).

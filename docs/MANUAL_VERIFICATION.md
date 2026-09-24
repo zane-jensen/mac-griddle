@@ -103,6 +103,10 @@ support per `docs/RESEARCH.md` §B.1.5).
   - [ ] **Panic hotkey mid-drag**: with live-resize on, start the gesture, anchor, and while
         still dragging press **⌃⌥⇧Esc**. The window should release cleanly and immediately —
         then confirm the regression check above still holds right after.
+  - [ ] A small flash/disappear-for-an-instant right on release is a known, currently
+        unresolved cosmetic issue (see `docs/REVIEW.md`'s tenth/eleventh fix entries — one
+        attempted fix made things worse and was fully reverted, so this is intentionally left
+        alone for now rather than risking another regression).
   - [ ] Toggle live-resize back off afterward (snap-on-release is the recommended default —
       see `docs/architecture/chunks/preferences-ui.md` for why).
 - [ ] Toggle **Launch MacGriddle at Login** on. Open System Settings → General → Login Items
